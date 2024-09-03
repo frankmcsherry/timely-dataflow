@@ -357,12 +357,19 @@ impl<A: Allocate> Worker<A> {
             }
         }
 
-        // Organize activations.
-        self.activations
-            .borrow_mut()
-            .advance();
+        // Commence a new round of scheduling, starting with dataflows.
+        // We probe the scheduler for active prefixes, where an empty response
+        // indicates that the scheduler has no work for us at the moment.
+        {   // Scoped to let borrow of `self.active_dataflows` drop.
+            let active_dataflows = &mut self.active_dataflows;
+            self.activations
+                .borrow_mut()
+                .for_extensions(&[], |index| active_dataflows.push(index));
+        }
 
-        if self.activations.borrow().is_idle() {
+        // If no dataflows are active, there is nothing to do. Consider parking.
+        if self.active_dataflows.is_empty() {
+
             // If the timeout is zero, don't bother trying to park.
             // More generally, we could put some threshold in here.
             if timeout != Some(Duration::new(0, 0)) {
@@ -380,15 +387,10 @@ impl<A: Allocate> Worker<A> {
                 self.logging().as_mut().map(|l| l.log(crate::logging::ParkEvent::unpark()));
             }
         }
-        else {   // Schedule active dataflows.
-
-            let active_dataflows = &mut self.active_dataflows;
-            self.activations
-                .borrow_mut()
-                .for_extensions(&[], |index| active_dataflows.push(index));
+        else {   // Schedule all active dataflows.
 
             let mut dataflows = self.dataflows.borrow_mut();
-            for index in active_dataflows.drain(..) {
+            for index in self.active_dataflows.drain(..) {
                 // Step dataflow if it exists, remove if not incomplete.
                 if let Entry::Occupied(mut entry) = dataflows.entry(index) {
                     // TODO: This is a moment at which a scheduling decision is being made.
