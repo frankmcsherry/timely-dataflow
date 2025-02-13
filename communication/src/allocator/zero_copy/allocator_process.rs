@@ -12,7 +12,7 @@ use crate::networking::MessageHeader;
 use crate::{Allocate, Push, Pull};
 use crate::allocator::{AllocateBuilder, Exchangeable};
 use crate::allocator::canary::Canary;
-
+use crate::allocator::zero_copy::bytes_slab::BytesRefill;
 use super::bytes_exchange::{BytesPull, SendEndpoint, MergeQueue};
 
 use super::push_pull::{Pusher, Puller};
@@ -28,13 +28,14 @@ pub struct ProcessBuilder {
     peers:  usize,                      // number of peer allocators.
     pushers: Vec<Receiver<MergeQueue>>, // for pushing bytes at other workers.
     pullers: Vec<Sender<MergeQueue>>,   // for pulling bytes from other workers.
+    refill: BytesRefill,
 }
 
 impl ProcessBuilder {
     /// Creates a vector of builders, sharing appropriate state.
     ///
     /// This method requires access to a byte exchanger, from which it mints channels.
-    pub fn new_vector(count: usize) -> Vec<ProcessBuilder> {
+    pub fn new_vector(count: usize, refill: BytesRefill) -> Vec<ProcessBuilder> {
 
         // Channels for the exchange of `MergeQueue` endpoints.
         let (pullers_vec, pushers_vec) = crate::promise_futures(count, count);
@@ -49,6 +50,7 @@ impl ProcessBuilder {
                     peers: count,
                     pushers,
                     pullers,
+                    refill: refill.clone(),
                 }
             )
             .collect()
@@ -70,7 +72,7 @@ impl ProcessBuilder {
         let mut sends = Vec::with_capacity(self.peers);
         for pusher in self.pushers.into_iter() {
             let queue = pusher.recv().expect("Failed to receive MergeQueue");
-            let sendpoint = SendEndpoint::new(queue);
+            let sendpoint = SendEndpoint::new(queue, self.refill.clone());
             sends.push(Rc::new(RefCell::new(sendpoint)));
         }
 
