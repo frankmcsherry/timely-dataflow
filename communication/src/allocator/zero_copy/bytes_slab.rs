@@ -21,7 +21,7 @@ pub struct BytesSlab {
 #[derive(Clone)]
 pub struct BytesRefill {
     /// Logic to acquire a new buffer of a certain number of bytes.
-    pub logic: std::sync::Arc<dyn Fn(usize) -> Box<dyn DerefMut<Target=[u8]>>+Send+Sync>,
+    pub logic: std::sync::Arc<dyn Fn(usize) -> Box<dyn DerefMut<Target=[u8]>+Send>+Send+Sync>,
     /// An optional limit on the number of empty buffers retained.
     pub limit: Option<usize>,
 }
@@ -111,7 +111,7 @@ impl BytesSlab {
 
 /// A wrapper for `Box<dyn DerefMut<Target=T>>` that dereferences to `T` rather than `dyn DerefMut<Target=T>`.
 struct BoxDerefMut {
-    boxed: Box<dyn DerefMut<Target=[u8]>+'static>,
+    boxed: Box<dyn DerefMut<Target=[u8]>+Send+'static>,
 }
 
 impl Deref for BoxDerefMut {

@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ToStreamBuilder` exposes the item type via the `Item` associated type instead of a trait-level generic, and the container builder moves to a method-level generic. This enables method-call syntax: `(0..3).to_stream_with_builder::<_, CapacityContainerBuilder<_>>(scope)` instead of the UFCS form `ToStreamBuilder::<CapacityContainerBuilder<_>>::to_stream_with_builder(0..3, scope)`.
 
+### `Bytes` is now `Sync`, and byte buffers must be `Send`
+
+`timely_bytes::arc::Bytes` now implements `Sync` in addition to `Send`. To make both impls sound, `BytesMut::from` now requires its payload to be `Send`. This is a breaking change to `timely_communication`: `BytesRefill::logic` now produces `Box<dyn DerefMut<Target=[u8]> + Send>` rather than `Box<dyn DerefMut<Target=[u8]>>`. Custom refills whose buffer type wraps a raw pointer (e.g. `NonNull`) must assert `unsafe impl Send` on that type.
+
 ## [0.29.0](https://github.com/TimelyDataflow/timely-dataflow/compare/timely-v0.28.1...timely-v0.29.0) - 2026-04-13
 
 The theme in this release is simplifying specialization by removing monomorphization sprawl.
