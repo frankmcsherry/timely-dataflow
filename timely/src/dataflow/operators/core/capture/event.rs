@@ -264,7 +264,7 @@ pub mod binary {
         pub fn new(r: R) -> Self {
             let refill = BytesRefill {
                 logic: Arc::new(|size| {
-                    Box::new(vec![0_u8; size]) as Box<dyn DerefMut<Target = [u8]>>
+                    Box::new(vec![0_u8; size]) as Box<dyn DerefMut<Target = [u8]> + Send>
                 }),
                 limit: None,
             };

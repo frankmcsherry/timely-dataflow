@@ -77,7 +77,7 @@ impl Default for Hooks {
         Self {
             log_fn: Arc::new(|_| None),
             refill:  BytesRefill {
-                logic: Arc::new(|size| Box::new(vec![0_u8; size]) as Box<dyn DerefMut<Target=[u8]>>),
+                logic: Arc::new(|size| Box::new(vec![0_u8; size]) as Box<dyn DerefMut<Target=[u8]>+Send>),
                 limit: None,
             },
             spill: None,

@@ -34,6 +34,10 @@ mod example {
         Box::new(LgallocHandle { handle, pointer, capacity })
     }
 
+    // `LgallocHandle` wraps a `NonNull`, which is `!Send`; lgalloc allocations are safe to
+    // move and deallocate across threads, so we assert `Send` to permit sharing as `Bytes`.
+    unsafe impl Send for LgallocHandle { }
+
     struct LgallocHandle {
         handle: Option<lgalloc::Handle>,
         pointer: NonNull<u8>,
@@ -67,7 +71,7 @@ mod example {
         lgalloc::lgalloc_set_config(&lgconfig);
 
         let refill = BytesRefill {
-            logic: std::sync::Arc::new(|size| lgalloc_refill(size) as Box<dyn DerefMut<Target=[u8]>>),
+            logic: std::sync::Arc::new(|size| lgalloc_refill(size) as Box<dyn DerefMut<Target=[u8]>+Send>),
             limit: None,
         };
 

@@ -60,7 +60,7 @@ pub mod arc {
     impl BytesMut {
 
         /// Create a new instance from a byte allocation.
-        pub fn from<B>(bytes: B) -> BytesMut where B : DerefMut<Target=[u8]>+'static {
+        pub fn from<B>(bytes: B) -> BytesMut where B : DerefMut<Target=[u8]>+Send+'static {
 
             // Sequester allocation behind an `Arc`, which *should* keep the address
             // stable for the lifetime of `sequestered`. The `Arc` also serves as our
@@ -187,8 +187,19 @@ pub mod arc {
     }
 
     // Synchronization happens through `self.sequestered`, which means to ensure that even
-    // across multiple threads the referenced range of bytes remain valid.
+    // across multiple threads the referenced range of bytes remains valid.
     unsafe impl Send for Bytes { }
+
+    // `Sync` holds because everything reachable through `&Bytes` is read-only or atomic:
+    // `Deref` yields `&[u8]` (and `u8: Sync`), the mutating methods take `&mut self`, and
+    // cloning only touches the atomic `Arc` refcount. There is no interior mutability and
+    // no path to a `&mut` from a shared reference.
+    //
+    // Note this requires only that the sequestered payload `B` be `Send` (enforced by
+    // `BytesMut::from`), not `Sync`: `B` is never exposed by reference, so it is never
+    // shared across threads. The only cross-thread use of `B` is its destructor, which may
+    // run on whichever thread drops the last `Arc` clone -- and that needs `Send`, not `Sync`.
+    unsafe impl Sync for Bytes { }
 
     impl Bytes {
 
