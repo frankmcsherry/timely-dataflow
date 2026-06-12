@@ -76,50 +76,100 @@ pub enum FrontierInterest {
 
 /// Operator internal connectivity, from inputs to outputs.
 pub type Connectivity<TS> = Vec<PortConnectivity<TS>>;
+
+/// Append-only accumulation of port summaries, prior to canonicalization.
+///
+/// Summaries may be introduced in any order, and repeatedly for the same port.
+/// The `freeze` method canonicalizes the accumulation into a `PortConnectivity`,
+/// which is the only way to read the contents back out.
+#[derive(Debug, Clone)]
+pub struct PortConnectivityBuilder<TS> {
+    /// Pairs of port and path summary antichain, in insertion order.
+    entries: Vec<(usize, Antichain<TS>)>,
+}
+
+impl<TS> Default for PortConnectivityBuilder<TS> {
+    fn default() -> Self {
+        Self { entries: Vec::new() }
+    }
+}
+
+impl<TS> PortConnectivityBuilder<TS> {
+    /// Inserts a summary element for `index`.
+    ///
+    /// Equivalent to `add_port` with a single-element antichain.
+    pub fn insert(&mut self, index: usize, element: TS) {
+        self.add_port(index, Antichain::from_elem(element));
+    }
+    /// Introduces a summary for `port`, which `freeze` will merge with any other
+    /// summaries for the same port.
+    ///
+    /// Summaries for the same port are merged by antichain insertion, and describe the
+    /// union of the claimed paths. Empty summaries are discarded.
+    pub fn add_port(&mut self, port: usize, summary: Antichain<TS>) {
+        if !summary.is_empty() {
+            self.entries.push((port, summary));
+        }
+    }
+    /// Canonicalizes the accumulated summaries into a readable `PortConnectivity`.
+    ///
+    /// Duplicate ports are merged by antichain insertion, whose result is independent of
+    /// the order in which elements were introduced.
+    pub fn freeze(mut self) -> PortConnectivity<TS> where TS : crate::PartialOrder {
+        self.entries.sort_unstable_by_key(|(port, _)| *port);
+        let mut entries: Vec<(usize, Antichain<TS>)> = Vec::with_capacity(self.entries.len());
+        for (port, summary) in self.entries {
+            match entries.last_mut() {
+                Some((last, antichain)) if *last == port => {
+                    for element in summary { antichain.insert(element); }
+                }
+                _ => { entries.push((port, summary)); }
+            }
+        }
+        PortConnectivity { entries }
+    }
+}
+
+impl<TS> FromIterator<(usize, Antichain<TS>)> for PortConnectivityBuilder<TS> {
+    fn from_iter<T>(iter: T) -> Self where T: IntoIterator<Item = (usize, Antichain<TS>)> {
+        Self { entries: iter.into_iter().filter(|(_,p)| !p.is_empty()).collect() }
+    }
+}
+
 /// Internal connectivity from one port to any number of opposing ports.
+///
+/// Always in canonical form: ports sorted and distinct, antichains non-empty.
+/// Values are constructed by `PortConnectivityBuilder::freeze` (or collected from
+/// an iterator), and offer no mutation.
 #[derive(serde::Serialize, serde::Deserialize, columnar::Columnar, Debug, Clone, Eq, PartialEq)]
 pub struct PortConnectivity<TS> {
-    tree: std::collections::BTreeMap<usize, Antichain<TS>>,
+    /// Pairs of port and path summary antichain, sorted by distinct port.
+    entries: Vec<(usize, Antichain<TS>)>,
 }
 
 impl<TS> Default for PortConnectivity<TS> {
     fn default() -> Self {
-        Self { tree: std::collections::BTreeMap::new() }
+        Self { entries: Vec::new() }
     }
 }
 
 impl<TS> PortConnectivity<TS> {
-    /// Inserts an element by reference, ensuring that the index exists.
-    pub fn insert(&mut self, index: usize, element: TS) -> bool where TS : crate::PartialOrder {
-        self.tree.entry(index).or_default().insert(element)
-    }
-    /// Inserts an element by reference, ensuring that the index exists.
-    pub fn insert_ref(&mut self, index: usize, element: &TS) -> bool where TS : crate::PartialOrder + Clone {
-        self.tree.entry(index).or_default().insert_ref(element)
-    }
-    /// Introduces a summary for `port`. Panics if a summary already exists.
-    pub fn add_port(&mut self, port: usize, summary: Antichain<TS>) {
-        if !summary.is_empty() {
-            let prior = self.tree.insert(port, summary);
-            assert!(prior.is_none());
-        }
-        else {
-            assert!(self.tree.remove(&port).is_none());
-        }
-    }
     /// Borrowing iterator of port identifiers and antichains.
     pub fn iter_ports(&self) -> impl Iterator<Item = (usize, &Antichain<TS>)> {
-        self.tree.iter().map(|(o,p)| (*o, p))
+        self.entries.iter().map(|(o,p)| (*o, p))
     }
     /// Returns the associated path summary, if it exists.
     pub fn get(&self, index: usize) -> Option<&Antichain<TS>> {
-        self.tree.get(&index)
+        self.entries
+            .binary_search_by_key(&index, |(port, _)| *port)
+            .ok()
+            .map(|position| &self.entries[position].1)
     }
 }
 
-impl<TS> FromIterator<(usize, Antichain<TS>)> for PortConnectivity<TS> {
+impl<TS: crate::PartialOrder> FromIterator<(usize, Antichain<TS>)> for PortConnectivity<TS> {
     fn from_iter<T>(iter: T) -> Self where T: IntoIterator<Item = (usize, Antichain<TS>)> {
-        Self { tree: iter.into_iter().filter(|(_,p)| !p.is_empty()).collect() }
+        iter.into_iter().collect::<PortConnectivityBuilder<TS>>().freeze()
     }
 }
 

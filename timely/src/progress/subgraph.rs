@@ -19,7 +19,7 @@ use crate::scheduling::activate::Activations;
 use crate::progress::frontier::{MutableAntichain, MutableAntichainFilter};
 use crate::progress::{Timestamp, Operate, operate::SharedProgress};
 use crate::progress::{Location, Port, Source, Target};
-use crate::progress::operate::{FrontierInterest, Connectivity, PortConnectivity};
+use crate::progress::operate::{FrontierInterest, Connectivity, PortConnectivity, PortConnectivityBuilder};
 use crate::progress::ChangeBatch;
 use crate::progress::broadcast::Progcaster;
 use crate::progress::reachability;
@@ -565,7 +565,7 @@ where
         // Note that we need to have `self.inputs()` elements in the summary
         // with each element containing `self.outputs()` antichains regardless
         // of how long `self.scope_summary` is
-        let mut internal_summary = vec![PortConnectivity::default(); self.inputs()];
+        let mut internal_summary = vec![PortConnectivityBuilder::default(); self.inputs()];
         for (input_idx, input) in self.scope_summary.iter().enumerate() {
             for (output_idx, output) in input.iter_ports() {
                 for outer in output.elements().iter().cloned().map(TInner::summarize) {
@@ -573,6 +573,7 @@ where
                 }
             }
         }
+        let internal_summary: Connectivity<_> = internal_summary.into_iter().map(|b| b.freeze()).collect();
 
         debug_assert_eq!(
             internal_summary.len(),

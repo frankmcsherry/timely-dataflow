@@ -74,7 +74,7 @@
 //! assert_eq!(results[2], ((Location::new_target(2, 0), 17), -1));
 //! ```
 
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::BinaryHeap;
 use std::cmp::Reverse;
 
 use columnar::{Vecs, Index as ColumnarIndex};
@@ -83,8 +83,8 @@ use crate::progress::Timestamp;
 use crate::progress::{Source, Target};
 use crate::progress::ChangeBatch;
 use crate::progress::{Location, Port};
-use crate::progress::operate::{Connectivity, PortConnectivity};
-use crate::progress::frontier::MutableAntichain;
+use crate::progress::operate::{Connectivity, PortConnectivity, PortConnectivityBuilder};
+use crate::progress::frontier::{Antichain, MutableAntichain};
 use crate::progress::timestamp::PathSummary;
 
 /// Build a `Vecs<Vecs<Vec<S>>>` from nested iterators.
@@ -282,31 +282,40 @@ impl<T: Timestamp> Builder<T> {
     /// ```
     pub fn is_acyclic(&self) -> bool {
 
-        let locations = self.shape.iter().map(|(targets, sources)| targets + sources).sum();
-        let mut in_degree = HashMap::with_capacity(locations);
+        // Dense per-location in-degree counts, with each node's targets and
+        // then sources laid out contiguously at a per-node offset.
+        let mut offsets = Vec::with_capacity(self.shape.len());
+        let mut locations = 0;
+        for (targets, sources) in self.shape.iter() {
+            offsets.push(locations);
+            locations += targets + sources;
+        }
+        let index_of = |location: &Location| {
+            let (targets, _) = self.shape[location.node];
+            match location.port {
+                Port::Target(port) => offsets[location.node] + port,
+                Port::Source(port) => offsets[location.node] + targets + port,
+            }
+        };
+        let mut in_degree = vec![0usize; locations];
 
         // Load edges as default summaries.
-        for (index, ports) in self.edges.iter().enumerate() {
-            for (output, targets) in ports.iter().enumerate() {
-                let source = Location::new_source(index, output);
-                in_degree.entry(source).or_insert(0);
+        for ports in self.edges.iter() {
+            for targets in ports.iter() {
                 for &target in targets.iter() {
-                    let target = Location::from(target);
-                    *in_degree.entry(target).or_insert(0) += 1;
+                    in_degree[index_of(&Location::from(target))] += 1;
                 }
             }
         }
 
         // Load default intra-node summaries.
         for (index, summary) in self.nodes.iter().enumerate() {
-            for (input, outputs) in summary.iter().enumerate() {
-                let target = Location::new_target(index, input);
-                in_degree.entry(target).or_insert(0);
+            for outputs in summary.iter() {
                 for (output, summaries) in outputs.iter_ports() {
                     let source = Location::new_source(index, output);
                     for summary in summaries.elements().iter() {
                         if summary == &Default::default() {
-                            *in_degree.entry(source).or_insert(0) += 1;
+                            in_degree[index_of(&source)] += 1;
                         }
                     }
                 }
@@ -314,16 +323,21 @@ impl<T: Timestamp> Builder<T> {
         }
 
         // A worklist of nodes that cannot be reached from the whole graph.
-        // Initially this list contains observed locations with no incoming
-        // edges, but as the algorithm develops we add to it any locations
-        // that can only be reached by nodes that have been on this list.
-        let mut worklist = Vec::with_capacity(in_degree.len());
-        for (key, val) in in_degree.iter() {
-            if *val == 0 {
-                worklist.push(*key);
+        // Initially this list contains locations with no incoming edges, but
+        // as the algorithm develops we add to it any locations that can only
+        // be reached by nodes that have been on this list.
+        let mut remaining = in_degree.iter().filter(|count| **count > 0).count();
+        let mut worklist = Vec::with_capacity(locations);
+        for (node, &(targets, sources)) in self.shape.iter().enumerate() {
+            for port in 0 .. targets {
+                let location = Location::new_target(node, port);
+                if in_degree[index_of(&location)] == 0 { worklist.push(location); }
+            }
+            for port in 0 .. sources {
+                let location = Location::new_source(node, port);
+                if in_degree[index_of(&location)] == 0 { worklist.push(location); }
             }
         }
-        in_degree.retain(|_key, val| val != &0);
 
         // Repeatedly remove nodes and update adjacent in-edges.
         while let Some(Location { node, port }) = worklist.pop() {
@@ -331,9 +345,10 @@ impl<T: Timestamp> Builder<T> {
                 Port::Source(port) => {
                     for target in self.edges[node][port].iter() {
                         let target = Location::from(*target);
-                        *in_degree.get_mut(&target).unwrap() -= 1;
-                        if in_degree[&target] == 0 {
-                            in_degree.remove(&target);
+                        let index = index_of(&target);
+                        in_degree[index] -= 1;
+                        if in_degree[index] == 0 {
+                            remaining -= 1;
                             worklist.push(target);
                         }
                     }
@@ -341,11 +356,12 @@ impl<T: Timestamp> Builder<T> {
                 Port::Target(port) => {
                     for (output, summaries) in self.nodes[node][port].iter_ports() {
                         let source = Location::new_source(node, output);
+                        let index = index_of(&source);
                         for summary in summaries.elements().iter() {
                             if summary == &Default::default() {
-                                *in_degree.get_mut(&source).unwrap() -= 1;
-                                if in_degree[&source] == 0 {
-                                    in_degree.remove(&source);
+                                in_degree[index] -= 1;
+                                if in_degree[index] == 0 {
+                                    remaining -= 1;
                                     worklist.push(source);
                                 }
                             }
@@ -355,8 +371,8 @@ impl<T: Timestamp> Builder<T> {
             }
         }
 
-        // Acyclic graphs should reduce to empty collections.
-        in_degree.is_empty()
+        // Acyclic graphs should drain every positive in-degree to zero.
+        remaining == 0
     }
 }
 
@@ -777,94 +793,195 @@ impl<T:Timestamp> Tracker<T> {
     }
 }
 
+/// A sorted map maintained as a single vector of power-of-two sorted runs.
+///
+/// The vector's length always reveals the run structure: the binary
+/// representation of the length, read from the high bit down, gives the
+/// sizes of the sorted runs in order. Adjacent runs may in fact be parts
+/// of larger sorted runs, but we make no attempt to claim those wins.
+///
+/// Keys are distinct across all runs. Novel keys are introduced by
+/// re-sorting the suffix whose run structure their addition changes, as
+/// in binary addition. Each element is re-sorted at most logarithmically
+/// often (so `O(n log^2 n)` comparisons in total, a log factor more than
+/// merging would cost, for much less code), and lookups visit at most
+/// logarithmically many runs.
+struct BinaryRuns<K, V> { entries: Vec<(K, V)> }
+
+impl<K: Ord, V> Default for BinaryRuns<K, V> {
+    fn default() -> Self { Self { entries: Vec::new() } }
+}
+
+impl<K: Ord, V> BinaryRuns<K, V> {
+    /// A mutable reference to the value at `key`, if present.
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        let mut position = None;
+        let mut offset = 0;
+        for bit in (0..usize::BITS).rev() {
+            let size = 1usize << bit;
+            if self.entries.len() & size != 0 {
+                let run = &self.entries[offset .. offset + size];
+                if let Ok(index) = run.binary_search_by(|(k, _)| k.cmp(key)) {
+                    position = Some(offset + index);
+                    break;
+                }
+                offset += size;
+            }
+        }
+        position.map(|index| &mut self.entries[index].1)
+    }
+
+    /// Introduces a batch of keys distinct from each other and from those present.
+    fn insert_batch(&mut self, batch: Vec<(K, V)>) {
+        if batch.is_empty() { return; }
+        let total = self.entries.len() + batch.len();
+        // Runs at the leading bits on which the lengths agree are unaffected; mask
+        // away the highest differing bit (the xor is non-zero) and below.
+        let stable = total & !(usize::MAX >> (self.entries.len() ^ total).leading_zeros());
+        self.entries.extend(batch);
+        self.entries[stable..].sort_unstable_by(|x, y| x.0.cmp(&y.0));
+    }
+
+    /// Merges all runs into one sorted vector.
+    fn into_sorted(mut self) -> Vec<(K, V)> {
+        self.entries.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+        self.entries
+    }
+}
+
 /// Determines summaries from locations to scope outputs.
 ///
 /// Specifically, for each location whose node identifier is non-zero, we compile
 /// the summaries along which they can reach each output.
 ///
 /// Graph locations may be missing from the output, in which case they have no
-/// paths to scope outputs.
+/// paths to scope outputs. The result is sorted by location.
 fn summarize_outputs<T: Timestamp>(
     nodes: &[Connectivity<T::Summary>],
     edges: &[Vec<Vec<Target>>],
-    ) -> HashMap<Location, PortConnectivity<T::Summary>>
+    ) -> Vec<(Location, PortConnectivity<T::Summary>)>
 {
     // A reverse edge map, to allow us to walk back up the dataflow graph.
-    let mut reverse = HashMap::new();
+    // Sorted by target location; each target should have at most one source.
+    let mut reverse_edges = Vec::new();
     for (node, outputs) in edges.iter().enumerate() {
         for (output, targets) in outputs.iter().enumerate() {
             for target in targets.iter() {
-                reverse.insert(
+                reverse_edges.push((
                     Location::from(*target),
                     Location { node, port: Port::Source(output) }
-                );
+                ));
             }
         }
     }
+    reverse_edges.sort_unstable();
+    reverse_edges.dedup();
 
     // A reverse map from operator outputs to inputs, along their internal summaries.
-    let mut reverse_internal: HashMap<_, Vec<_>> = HashMap::new();
+    // Sorted by source location, so that the entries for a location are contiguous.
+    let mut reverse_internal = Vec::new();
     for (node, connectivity) in nodes.iter().enumerate() {
         for (input, outputs) in connectivity.iter().enumerate() {
             for (output, summary) in outputs.iter_ports() {
-                reverse_internal
-                    .entry(Location::new_source(node, output))
-                    .or_default()
-                    .push((input, summary));
+                reverse_internal.push((Location::new_source(node, output), input, summary));
             }
         }
     }
+    reverse_internal.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
 
-    let mut results: HashMap<Location, PortConnectivity<T::Summary>> = HashMap::new();
-    let mut worklist = VecDeque::<(Location, usize, T::Summary)>::new();
+    // Accumulated summaries to scope outputs, keyed by `(location, output)`.
+    let mut accumulated: BinaryRuns<(Location, usize), Antichain<T::Summary>> = BinaryRuns::default();
 
-    let outputs =
+    // Round-based (semi-naive) fixed point. Each round walks reverse edges and reverse
+    // internal summaries from the triples that changed last round, and the proposals
+    // that improve the accumulated antichains form the next round's work.
+    // The scope may have no outputs, in which case we can do no work.
+    let mut todo: Vec<(Location, usize, T::Summary)> =
     edges
         .iter()
         .flat_map(|x| x.iter())
         .flat_map(|x| x.iter())
-        .filter(|target| target.node == 0);
+        .filter(|target| target.node == 0)
+        .map(|target| (Location::from(*target), target.port, Default::default()))
+        .collect();
 
-    // The scope may have no outputs, in which case we can do no work.
-    for output_target in outputs {
-        worklist.push_back((Location::from(*output_target), output_target.port, Default::default()));
-    }
+    let mut proposals: Vec<((Location, usize), T::Summary)> = Vec::new();
 
     // Loop until we stop discovering novel reachability paths.
-    while let Some((location, output, summary)) = worklist.pop_front() {
-        match location.port {
+    while !todo.is_empty() {
 
-            // This is an output port of an operator, or a scope input.
-            // We want to crawl up the operator, to its inputs.
-            Port::Source(_output_port) => {
-                if let Some(inputs) = reverse_internal.get(&location) {
-                    for (input_port, operator_summary) in inputs.iter() {
+        // Collect proposed summaries from the triples changed last round.
+        for (location, output, summary) in todo.drain(..) {
+            match location.port {
+
+                // This is an output port of an operator, or a scope input.
+                // We want to crawl up the operator, to its inputs.
+                Port::Source(_output_port) => {
+                    let start = reverse_internal.partition_point(|(source, _, _)| *source < location);
+                    let inputs = reverse_internal[start..].iter().take_while(|(source, _, _)| *source == location);
+                    for (_, input_port, operator_summary) in inputs {
                         let new_location = Location::new_target(location.node, *input_port);
                         for op_summary in operator_summary.elements().iter() {
                             if let Some(combined) = op_summary.followed_by(&summary) {
-                                if results.entry(new_location).or_default().insert_ref(output, &combined) {
-                                    worklist.push_back((new_location, output, combined));
-                                }
+                                proposals.push(((new_location, output), combined));
                             }
                         }
                     }
                 }
-            }
 
-            // This is an input port of an operator, or a scope output.
-            // We want to walk back the edges leading to it.
-            Port::Target(_port) => {
-                // Each target should have (at most) one source.
-                if let Some(&source) = reverse.get(&location) {
-                    if results.entry(source).or_default().insert_ref(output, &summary) {
-                        worklist.push_back((source, output, summary));
+                // This is an input port of an operator, or a scope output.
+                // We want to walk back the (unique) edge leading to it.
+                Port::Target(_port) => {
+                    if let Ok(index) = reverse_edges.binary_search_by_key(&location, |(target, _)| *target) {
+                        proposals.push(((reverse_edges[index].1, output), summary));
                     }
                 }
-            },
+            }
         }
+
+        // Merge the batch of proposals into the accumulated summaries. Proposals are
+        // first collapsed per key into an antichain, so that only elements novel to
+        // the accumulated antichain (in an order-independent sense) seed the next round.
+        proposals.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+        let mut fresh: Vec<((Location, usize), Antichain<T::Summary>)> = Vec::new();
+        let mut batch: Antichain<T::Summary> = Antichain::new();
+        let mut iter = proposals.drain(..).peekable();
+        while let Some(((location, output), summary)) = iter.next() {
+            // Collapse this round's proposals for the key into one antichain.
+            batch.insert(summary);
+            while iter.peek().map(|(key, _)| *key == (location, output)).unwrap_or(false) {
+                batch.insert(iter.next().unwrap().1);
+            }
+            if let Some(antichain) = accumulated.get_mut(&(location, output)) {
+                for summary in batch.drain() {
+                    if antichain.insert_ref(&summary) {
+                        todo.push((location, output, summary));
+                    }
+                }
+            }
+            else {
+                todo.extend(batch.elements().iter().map(|summary| (location, output, summary.clone())));
+                fresh.push(((location, output), std::mem::take(&mut batch)));
+            }
+        }
+
+        // Introduce the novel keys.
+        accumulated.insert_batch(fresh);
     }
 
-    results
+    // Merge all runs into one sorted list, and group it by location.
+    let mut results: Vec<(Location, PortConnectivityBuilder<T::Summary>)> = Vec::new();
+    for ((location, output), antichain) in accumulated.into_sorted() {
+        match results.last_mut() {
+            Some((last, connectivity)) if *last == location => { connectivity.add_port(output, antichain); }
+            _ => {
+                let mut connectivity = PortConnectivityBuilder::default();
+                connectivity.add_port(output, antichain);
+                results.push((location, connectivity));
+            }
+        }
+    }
+    results.into_iter().map(|(location, builder)| (location, builder.freeze())).collect()
 }
 
 /// Logging types for reachability tracking events.

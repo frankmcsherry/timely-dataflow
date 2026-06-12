@@ -12,7 +12,7 @@ use crate::scheduling::{Schedule, Activations};
 
 use crate::progress::{Source, Target};
 use crate::progress::{Timestamp, Operate, operate::SharedProgress, Antichain};
-use crate::progress::operate::{FrontierInterest, Connectivity, PortConnectivity};
+use crate::progress::operate::{FrontierInterest, Connectivity, PortConnectivityBuilder};
 use crate::Container;
 use crate::dataflow::{Stream, Scope, OperatorSlot};
 use crate::dataflow::channels::pushers::Tee;
@@ -55,7 +55,7 @@ pub struct OperatorBuilder<'scope, T: Timestamp> {
     slot: OperatorSlot<'scope, T>,
     address: Rc<[usize]>,    // path to the operator (ending with index).
     shape: OperatorShape,
-    summary: Connectivity<<T as Timestamp>::Summary>,
+    summary: Vec<PortConnectivityBuilder<<T as Timestamp>::Summary>>,
 }
 
 impl<'scope, T: Timestamp> OperatorBuilder<'scope, T> {
@@ -113,8 +113,9 @@ impl<'scope, T: Timestamp> OperatorBuilder<'scope, T> {
 
         self.shape.inputs += 1;
         self.shape.notify.push(FrontierInterest::Always);
-        let connectivity: PortConnectivity<_> = connection.into_iter().collect();
-        assert!(connectivity.iter_ports().all(|(o,_)| o < self.shape.outputs));
+        let connectivity: PortConnectivityBuilder<_> = connection.into_iter()
+            .inspect(|(o,_)| assert!(*o < self.shape.outputs))
+            .collect();
         self.summary.push(connectivity);
 
         receiver
@@ -182,7 +183,7 @@ impl<'scope, T: Timestamp> OperatorBuilder<'scope, T> {
             activations: self.scope.activations(),
             logic,
             shared_progress: Rc::new(RefCell::new(SharedProgress::new(inputs, outputs))),
-            summary: self.summary,
+            summary: self.summary.into_iter().map(|b| b.freeze()).collect(),
         };
 
         self.slot.install(Box::new(operator));
