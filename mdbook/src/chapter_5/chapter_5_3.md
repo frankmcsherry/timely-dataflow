@@ -23,6 +23,54 @@ What we want to achieve is:
 In Timely, we provide a set of `core` operators that are generic on the container type they can handle.
 In most cases, the `core` operators are an immediate generalization of their non-core variant, providing the semantically equivalent functionality.
 
++## Columnar transport
+
+The `timely::container::columnar` module provides `ColumnarContainer` and
+`ColumnarBuilder` for records deriving `columnar::Columnar`. The container can
+hold mutable typed columns while it is being assembled and retain a borrowed
+view over communication bytes after binary transport. This avoids rebuilding
+owned rows at the receiver.
+
+```rust
+use columnar::Index;
+use timely::container::columnar::ColumnarBuilder;
+use timely::dataflow::operators::{Exchange, InspectCore};
+use timely::dataflow::InputHandle;
+
+#[derive(columnar::Columnar)]
+struct Record {
+    key: u64,
+    value: String,
+}
+
+type Columns = <Record as columnar::Columnar>::Container;
+
+timely::example(|scope| {
+    let mut input = InputHandle::<u64, ColumnarBuilder<Columns>>::new_with_builder();
+    input
+        .to_stream(scope)
+        .exchange(|record| *record.key)
+        .inspect_container(|event| {
+            if let Ok((_time, records)) = event {
+                for record in records.borrow().into_index_iter() {
+                    println!("{}: {:?}", record.key, record.value);
+                }
+            }
+        });
+
+    input.send(RecordReference { key: &0, value: "zero" });
+});
+```
+
+`CommunicationConfig::ProcessBinary` and cluster communication serialize a
+typed columnar container into shared byte slabs and return its column
+allocations immediately. This is the path on which the builder's bounded
+recycling is most effective. `CommunicationConfig::Process` moves typed
+containers through one-way inter-thread channels; it currently has no matching
+resource-return path, so columnar exchange builders may need to regrow their
+columns at each logical time.
+
+
 ## Limitations
 
 
