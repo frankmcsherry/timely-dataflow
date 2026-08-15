@@ -69,9 +69,6 @@ pub use timely_container::Accountable;
 /// Re-export of the `timely_container` crate.
 pub mod container {
     pub use timely_container::*;
-
-    /// Columnar containers that can retain serialized communication bytes.
-    pub mod columnar;
 }
 
 /// Re-export of the `timely_communication` crate.

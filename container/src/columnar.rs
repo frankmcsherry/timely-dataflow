@@ -11,12 +11,12 @@ use std::collections::VecDeque;
 use ::columnar::bytes::stash::Stash;
 use ::columnar::{Index, Len};
 
-use crate::bytes::arc::Bytes;
-use crate::container::{
+use timely_bytes::arc::Bytes;
+
+use crate::{
     Accountable, ContainerBuilder, DrainContainer, LengthPreservingContainerBuilder, PushInto,
     SizableContainer,
 };
-use crate::dataflow::channels::ContainerBytes;
 
 /// Preferred serialized size of a columnar transport container.
 pub const DEFAULT_BUFFER_BYTES: usize = 1 << 20;
@@ -128,21 +128,22 @@ where
     }
 }
 
-impl<C: ::columnar::ContainerBytes> ContainerBytes for ColumnarContainer<C> {
-    fn from_bytes(bytes: Bytes) -> Self {
+impl<C: ::columnar::ContainerBytes> ColumnarContainer<C> {
+    /// Wraps and validates bytes containing a columnar encoding.
+    pub fn from_bytes(bytes: Bytes) -> Self {
         Self {
             stash: Stash::try_from_bytes(bytes).expect("valid columnar container bytes"),
         }
     }
 
-    fn length_in_bytes(&self) -> usize {
+    /// Reports the number of bytes in this container's wire encoding.
+    pub fn length_in_bytes(&self) -> usize {
         self.stash.length_in_bytes()
     }
 
-    fn into_bytes<W: std::io::Write>(&self, writer: &mut W) {
-        self.stash
-            .write_bytes(writer)
-            .expect("columnar container write failed")
+    /// Writes this container's columnar encoding.
+    pub fn write_bytes<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        self.stash.write_bytes(writer)
     }
 }
 
@@ -300,9 +301,9 @@ mod tests {
         });
 
         let mut encoded = Vec::new();
-        ContainerBytes::into_bytes(&original, &mut encoded);
+        original.write_bytes(&mut encoded).unwrap();
         let received = ColumnarContainer::<Columns>::from_bytes(
-            crate::bytes::arc::BytesMut::from(encoded).freeze(),
+            timely_bytes::arc::BytesMut::from(encoded).freeze(),
         );
 
         assert!(received.is_bytes());

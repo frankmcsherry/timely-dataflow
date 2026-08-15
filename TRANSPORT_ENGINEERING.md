@@ -28,7 +28,8 @@ when its logical channel becomes quiescent.
 
 ## Revised transport tranche
 
-- `timely::container::columnar::{ColumnarContainer, ColumnarBuilder}` promotes
+- `timely_container::columnar::{ColumnarContainer, ColumnarBuilder}` (also
+  re-exported from `timely::container`) promotes
   the former example-only implementation into supported infrastructure.
   Binary receivers retain a view into compact communication `Bytes` rather
   than reconstructing owned rows.

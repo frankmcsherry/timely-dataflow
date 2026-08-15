@@ -25,8 +25,9 @@ In most cases, the `core` operators are an immediate generalization of their non
 
 +## Columnar transport
 
-The `timely::container::columnar` module provides `ColumnarContainer` and
-`ColumnarBuilder` for records deriving `columnar::Columnar`. The container can
+The default-enabled `columnar` feature of `timely_container` provides
+`ColumnarContainer` and `ColumnarBuilder`, re-exported through
+`timely::container::columnar`, for records deriving `columnar::Columnar`. The container can
 hold mutable typed columns while it is being assembled and retain a borrowed
 view over communication bytes after binary transport. This avoids rebuilding
 owned rows at the receiver.
