@@ -7,77 +7,81 @@ release builds, 5,000 fixed-width 64-byte records per worker per logical round,
 and all-to-all routing. Allocation counts include `alloc` and `realloc`; bytes
 are requested bytes, not live-set size.
 
-## Implemented transport tranche
+## Memory-footprint constraint
+
+Transport scratch space must obey this quiescent-state invariant:
+
+> Quiescent retained transport capacity is bounded per worker or allocator,
+> independent of the number of logical channels and destination workers.
+
+A fixed per-channel pool does not satisfy this property, even when its local
+bound looks small. An exchange distributor owns one builder per destination.
+Retaining one preferred-size container in every builder can therefore scale as
+`channels × source workers × destination workers × container capacity`. At
+10,000 exchange channels, 100 workers, and 1 MiB containers, the theoretical
+process-wide bound is 100 TB. Sixteen-container input or thread-channel pools
+scale as `channels × workers × 16 × capacity` and are also unacceptable.
+
+The zero-copy allocator is the appropriate place to retain a process-wide,
+budgeted set of compact byte slabs. Typed column scratch space should disappear
+when its logical channel becomes quiescent.
+
+## Revised transport tranche
 
 - `timely::container::columnar::{ColumnarContainer, ColumnarBuilder}` promotes
   the former example-only implementation into supported infrastructure.
-  Received binary containers retain their serialized `Bytes`; typed column
-  allocations are recycled through a bounded two-container builder pool.
-- `CapacityContainerBuilder` now retains one returned spare across `finish()`.
-  Previously, the drain-completing call overwrote that spare with `None`, making
-  every logical timestamp an allocation boundary.
-- `ColumnarContainer::ensure_capacity` selects the typed allocation returned by
-  the pusher when starting the next empty batch. The default typed container in
-  `current` previously masked the useful spare.
-- The thread-local channel returns at most 16 consumed values to its producer.
-  Ownership-taking `recv()` calls do not return a value, and tests cover both
-  cases and the bound. Generic input handles swap a bounded set of consumed
-  containers back into later pull slots, completing that ownership round trip
-  without reclaiming containers explicitly taken by user code.
+  Binary receivers retain a view into compact communication `Bytes` rather
+  than reconstructing owned rows.
+- A columnar builder may recycle returned typed columns only while its current
+  sequence is active. The final `finish()` call and `relax()` both release
+  `current`, returned containers, and the bounded transient spare list.
+- The proposed generic changes to `CapacityContainerBuilder`,
+  `InputHandleCore`, and the thread-local allocator were removed. Their
+  seemingly small per-instance bounds multiplied by channel and worker counts.
+- Tests include 10,000 independently activated and quiesced builders and assert
+  that none retains a current allocation or pooled container.
 - `timely/examples/transport_alloc.rs` supplies a repeatable typed/binary ×
-  vector/columnar matrix, allocation-size histogram, warmup, record-count
-  validation, and a direct builder measurement.
+  vector/columnar matrix, allocation-size histogram, warmup, and record-count
+  validation.
 
-### Results
+### Allocation versus retention
 
-The diagnostic, pre-fix binary-columnar run allocated 257.6 bytes/record
-(28,367 allocation calls for one million records). The same exact unwarmed run
-after retaining and selecting the returned spare allocated 26.4 bytes/record
-(2,921 calls), a 9.8x reduction in requested bytes and 9.7x fewer allocation
-calls.
+The initial recycling experiment found a real allocation mechanism. For one
+million records, binary columnar fell from 257.6 to 26.4 requested bytes/record
+and allocation calls fell 9.7x. Repeated geometric growth fell from 126.8 MB to
+3.9 MB in the 4–64 KiB bucket and from 93.1 MB to 3.2 MB in the 64–256 KiB
+bucket. The exact short-run throughput moved from 64.2 to 84.4 million
+records/second.
 
-The reduction came from two necessary fixes. `CapacityContainerBuilder::finish`
-discarded the container returned by the pusher on its final drain call. Fixing
-that alone did not improve the measurement: `ColumnarContainer::ensure_capacity`
-still preferred an allocation-free typed `current` over the useful typed spare.
-Once it selected the returned spare, repeated geometric growth fell from
-126.8 MB to 3.9 MB in the 4–64 KiB allocation bucket and from 93.1 MB to
-3.2 MB in the 64–256 KiB bucket. The 18.6 MB of communication-slab growth was
-unchanged. The promoted builder, thread-local resource return, and input-handle
-swap complete other ownership paths but did not cause this headline
-`ProcessBinary` reduction.
+That result was not free: it converted allocation churn into long-lived
+per-destination typed column capacity. On upstream 0.31 the retained variant
+reached 9.58 allocated bytes/record and 95.9 million records/second after
+warmup, but violated the quiescent-state invariant above. Those numbers are
+recorded as a rejected point in the tradeoff space, not as the behavior of the
+revised PR.
 
-After a one-round warmup, a two-million-record matrix produced:
+With all per-channel retention removed, the same two-million-record matrix
+produced:
 
-| Transport | Container | allocations | bytes/record | records/s |
-|---|---:|---:|---:|---:|
-| typed | `Vec<Record>` | 19,318 | 66.6 | 353M |
-| binary | `Vec<Record>` | 16,863 | 72.5 | 97M |
-| typed | columnar | 53,617 | 236.4 | 152M |
-| binary | columnar | 4,050 | 10.1 | 176M |
-| none | direct columnar builder | 0 | 0.0 | 538M |
+| Transport | Container | allocated bytes/record | records/s |
+|---|---:|---:|---:|
+| typed | `Vec<Record>` | 68.4 | 309M |
+| binary | `Vec<Record>` | 80.7 | 98M |
+| typed | columnar | 472.3 | 85M |
+| binary | columnar | 480.3 | 64M |
+| none | direct columnar builder | 236.0 | 134M |
 
-These are diagnostic microbenchmarks, not promises about application
-throughput. The allocation result is robust: direct construction is
-allocation-free after warmup, and binary columnar eliminates the repeated
-4 KiB–256 KiB geometric growth seen in typed columnar. Its remaining measured
-bytes are almost entirely nineteen 1 MiB communication-slab acquisitions and
-therefore amortize with a longer run.
+The fixed-width columnar microbenchmark is now deliberately allocation-heavy:
+source and exchange scratch columns are regrown after each quiescence boundary.
+It demonstrates that the 9.8x allocation reduction was purchased with retained
+state. Columnar transport can still be useful for variable-width records,
+receiver-side borrowed access, and avoiding reconstruction of owned rows, but
+the fixed-width result is not a throughput recommendation.
 
-After porting the change from the original 0.29 snapshot to upstream 0.31 and
-its `columnar` 0.13 dependency, the warmed binary-columnar case reproduced at
-9.58 allocated bytes/record and 95.9 million records/second. The original exact
-pre/post timing moved from 64.2 to 84.4 million records/second, but those runs
-were only 12–22 ms; treat the apparent 31% speedup as directional until an
-interleaved multi-second A/B benchmark is available.
-
-Typed columnar remains a regression because `CommunicationConfig::Process`
-uses one-way `std::sync::mpsc` ownership transfer. There is no route by which a
-target can return a consumed container to the correct source. The columnar
-layout multiplies geometric growth across its component columns, so losing the
-whole batch allocation each round is more expensive than losing one vector.
-The supported recommendation is consequently columnar plus `ProcessBinary`
-(or cluster zero-copy communication), not columnar plus typed process channels.
+A future recycling design should use a worker-wide byte budget shared among
+active channels, rather than a count embedded in each builder. Doing that well
+requires a capacity-reporting/reinitialization contract for generic containers;
+it is deferred rather than hidden behind an unsafe aggregate memory bound.
 
 ## Pull request 807: progress exchange
 
@@ -159,9 +163,9 @@ costs can be removed:
 - Split `progress/subgraph.rs` into topology construction, runtime progress
   exchange, and scheduling/activation state. This would make it possible to
   replace the progress medium without editing the progress calculus.
-- Treat `ContainerBuilder::relax` as “trim excess, retain a bounded working
-  set,” not “drop all storage.” It is called at scheduling boundaries and can
-  silently become a steady-state allocation boundary.
+- Specify `ContainerBuilder::relax` as a quiescence and memory-reclamation
+  boundary. Any future retention should be charged to an explicit worker-wide
+  byte budget, not an implicit per-builder count.
 - Make resource-return behavior an explicit allocator capability. `Process`
   cannot return typed resources to a source; binary allocators return the
   typed input immediately; thread-local channels can return consumed values.

@@ -148,9 +148,10 @@ impl<C: ::columnar::ContainerBytes> ContainerBytes for ColumnarContainer<C> {
 
 /// Builds bounded-size [`ColumnarContainer`] batches from individual records.
 ///
-/// Typed column allocations returned by a pusher are retained in a small pool.
-/// This is particularly effective with binary communication, whose serializer
-/// returns the typed container immediately after writing it into a byte slab.
+/// Typed column allocations returned by a pusher are reused while a sequence is
+/// active. Draining [`ContainerBuilder::finish`] or calling
+/// [`ContainerBuilder::relax`] releases all typed allocations, so quiescent
+/// memory does not scale with the number of builders or logical channels.
 pub struct ColumnarBuilder<C, const PREFERRED_BYTES: usize = DEFAULT_BUFFER_BYTES> {
     current: C,
     needs_current: bool,
@@ -243,7 +244,20 @@ impl<C: ::columnar::ContainerBytes, const PREFERRED_BYTES: usize> ContainerBuild
         if !self.needs_current {
             self.emit_current();
         }
-        self.extract()
+        self.reclaim_returned();
+        if let Some(container) = self.pending.pop_front() {
+            self.returned = Some(container);
+            self.returned.as_mut()
+        } else {
+            // `finish` is called until it returns `None`. Treat that final
+            // call as a quiescence boundary: retaining even one preferred-size
+            // allocation per builder becomes prohibitive in wide dataflows.
+            self.current = C::default();
+            self.needs_current = false;
+            self.returned = None;
+            self.spares.clear();
+            None
+        }
     }
 
     fn relax(&mut self) {
@@ -252,12 +266,11 @@ impl<C: ::columnar::ContainerBytes, const PREFERRED_BYTES: usize> ContainerBuild
             "finish must drain pending columnar containers"
         );
         assert!(self.needs_current || self.current.is_empty());
-        // `relax` occurs at the end of each pushed sequence, often once per
-        // scheduling activation. Releasing the returned columns here would
-        // turn normal progress boundaries into allocation boundaries. Keep a
-        // bounded working set; dropping the builder still releases it.
-        self.reclaim_returned();
-        self.ensure_current();
+        // A fixed per-builder pool has an unacceptable aggregate bound for
+        // dataflows with many channels and workers. The zero-copy transport
+        // owns the process-wide byte slabs worth retaining; typed column
+        // scratch space is transient.
+        *self = Self::default();
     }
 }
 
@@ -300,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_reclaims_a_returned_typed_container() {
+    fn builder_releases_typed_containers_after_finish() {
         let mut builder = ColumnarBuilder::<Columns, 64>::default();
         for key in 0..16 {
             builder.push_into(TestRecordReference {
@@ -309,15 +322,36 @@ mod tests {
             });
         }
 
-        assert!(builder.extract().is_some());
-        while builder.extract().is_some() {}
-        let reclaimed = builder.spares.len();
-        assert!(reclaimed > 0);
+        while builder.finish().is_some() {}
 
-        builder.push_into(TestRecordReference {
-            key: &99,
-            value: "again",
-        });
-        assert_eq!(builder.spares.len(), reclaimed - 1);
+        assert!(builder.current.is_empty());
+        assert!(!builder.needs_current);
+        assert!(builder.returned.is_none());
+        assert!(builder.spares.is_empty());
+        assert!(builder.pending.is_empty());
+    }
+
+    #[test]
+    fn wide_quiescent_builder_set_has_no_pooled_containers() {
+        let mut builders = std::iter::repeat_with(ColumnarBuilder::<Columns, 64>::default)
+            .take(10_000)
+            .collect::<Vec<_>>();
+
+        for (key, builder) in builders.iter_mut().enumerate() {
+            let key = key as u64;
+            builder.push_into(TestRecordReference {
+                key: &key,
+                value: "value",
+            });
+            while builder.finish().is_some() {}
+        }
+
+        for builder in builders {
+            assert!(builder.current.is_empty());
+            assert!(!builder.needs_current);
+            assert!(builder.returned.is_none());
+            assert!(builder.spares.is_empty());
+            assert!(builder.pending.is_empty());
+        }
     }
 }

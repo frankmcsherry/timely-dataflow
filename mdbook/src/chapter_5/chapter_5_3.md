@@ -64,11 +64,12 @@ timely::example(|scope| {
 
 `CommunicationConfig::ProcessBinary` and cluster communication serialize a
 typed columnar container into shared byte slabs and return its column
-allocations immediately. This is the path on which the builder's bounded
-recycling is most effective. `CommunicationConfig::Process` moves typed
-containers through one-way inter-thread channels; it currently has no matching
-resource-return path, so columnar exchange builders may need to regrow their
-columns at each logical time.
+allocations immediately. A builder can reuse those columns while its current
+sequence is active. Draining `finish` or calling `relax` releases the typed
+working set: quiescent memory must not grow in proportion to the number of
+logical channels or destination workers. `CommunicationConfig::Process` moves
+typed containers through one-way inter-thread channels and has no matching
+resource-return path.
 
 
 ## Limitations

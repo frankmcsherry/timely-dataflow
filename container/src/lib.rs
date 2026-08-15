@@ -136,9 +136,8 @@ mod noop {
 
 /// A default container builder that uses length and preferred capacity to chunk data.
 ///
-/// Maintains a single empty allocation for reuse across calls, including across
-/// [`Self::finish`]. This bounds retained memory to one container while avoiding
-/// an allocation boundary at each logical timestamp.
+/// Maintains a single empty allocation between [`Self::push_into`] and [`Self::extract`], but not
+/// across [`Self::finish`] to maintain a low memory footprint.
 ///
 /// Maintains FIFO order.
 #[derive(Default, Debug)]
@@ -185,36 +184,12 @@ impl<C: Accountable + Default> ContainerBuilder for CapacityContainerBuilder<C> 
         if !self.current.is_empty() {
             self.pending.push_back(std::mem::take(&mut self.current));
         }
-        if let Some(container) = self.pending.pop_front() {
-            self.empty = Some(container);
-            self.empty.as_mut()
-        } else {
-            None
-        }
+        self.empty = self.pending.pop_front();
+        self.empty.as_mut()
     }
 }
 
 impl<C: Accountable + SizableContainer + Default> LengthPreservingContainerBuilder for CapacityContainerBuilder<C> { }
-
-#[cfg(test)]
-mod tests {
-    use super::{CapacityContainerBuilder, ContainerBuilder, PushInto};
-
-    #[test]
-    fn capacity_builder_retains_returned_container_across_finish() {
-        let mut builder = CapacityContainerBuilder::<Vec<u64>>::default();
-        builder.push_into(1);
-
-        let container = builder.finish().expect("one finished container");
-        let allocation = container.as_ptr();
-        container.clear();
-        assert!(builder.finish().is_none());
-
-        builder.push_into(2);
-        let reused = builder.finish().expect("one finished container");
-        assert_eq!(reused.as_ptr(), allocation);
-    }
-}
 
 impl<T> Accountable for Vec<T> {
     #[inline] fn record_count(&self) -> i64 { i64::try_from(Vec::len(self)).unwrap() }

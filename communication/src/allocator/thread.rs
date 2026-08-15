@@ -94,78 +94,13 @@ impl<T> Pull<T> for Puller<T> {
     #[inline]
     fn pull(&mut self) -> &mut Option<T> {
         let mut borrow = self.source.borrow_mut();
-        if let Some(element) = self.current.take() {
-            // Retain a bounded number of values for the producer to reclaim.
-            // Consumers that took the value with `recv()` leave `current` as
-            // `None` and therefore correctly return nothing.
-            if borrow.1.len() < 16 {
-                borrow.1.push_back(element);
-            }
-        }
+        // if let Some(element) = self.current.take() {
+        //     // TODO : Arbitrary constant.
+        //     if borrow.1.len() < 16 {
+        //         borrow.1.push_back(element);
+        //     }
+        // }
         self.current = borrow.0.pop_front();
         &mut self.current
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pull_returns_unconsumed_resources_to_the_producer() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let (mut pusher, mut puller) = Thread::new_from(0, events);
-
-        let mut first = Vec::with_capacity(1024);
-        first.extend(0..16);
-        let first_capacity = first.capacity();
-        let mut first = Some(first);
-        pusher.push(&mut first);
-        assert!(first.is_none());
-
-        puller.pull().as_mut().unwrap().clear();
-        assert!(puller.pull().is_none());
-
-        let mut second = Some(vec![99]);
-        pusher.push(&mut second);
-        let returned = second.expect("producer should reclaim the prior value");
-        assert!(returned.is_empty());
-        assert_eq!(returned.capacity(), first_capacity);
-    }
-
-    #[test]
-    fn recv_transfers_ownership_without_returning_a_resource() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let (mut pusher, mut puller) = Thread::new_from(0, events);
-
-        pusher.send(vec![1, 2, 3]);
-        assert_eq!(puller.recv(), Some(vec![1, 2, 3]));
-        assert!(puller.pull().is_none());
-
-        let mut next = Some(vec![4]);
-        pusher.push(&mut next);
-        assert!(next.is_none(), "a taken value must not appear in the return queue");
-    }
-
-    #[test]
-    fn resource_return_queue_is_bounded() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let (mut pusher, mut puller) = Thread::new_from(0, events);
-
-        for value in 0..32 {
-            pusher.send(vec![value]);
-        }
-        for _ in 0..32 {
-            puller.pull().as_mut().unwrap().clear();
-        }
-        assert!(puller.pull().is_none());
-
-        let mut returned = 0;
-        for _ in 0..32 {
-            let mut item = Some(Vec::new());
-            pusher.push(&mut item);
-            returned += usize::from(item.is_some());
-        }
-        assert_eq!(returned, 16);
     }
 }

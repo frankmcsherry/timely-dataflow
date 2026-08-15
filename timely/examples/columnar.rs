@@ -3,13 +3,13 @@
 use std::collections::HashMap;
 
 use columnar::Index;
-use timely::container::columnar::{ColumnarBuilder, ColumnarContainer};
+use timely::Accountable;
 use timely::container::CapacityContainerBuilder;
-use timely::dataflow::channels::pact::{ExchangeCore, Pipeline};
-use timely::dataflow::operators::{InspectCore, Operator, Probe};
+use timely::container::columnar::{ColumnarBuilder, ColumnarContainer};
 use timely::dataflow::InputHandle;
 use timely::dataflow::ProbeHandle;
-use timely::Accountable;
+use timely::dataflow::channels::pact::{ExchangeCore, Pipeline};
+use timely::dataflow::operators::{InspectCore, Operator, Probe};
 
 // Creates `WordCountContainer` and `WordCountReference` structs,
 // as well as various implementations relating them to `WordCount`.

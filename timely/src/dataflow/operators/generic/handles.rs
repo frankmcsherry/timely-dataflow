@@ -31,8 +31,6 @@ pub struct InputHandleCore<T: Timestamp, C, P: Pull<Message<T, C>>> {
     /// Staged capabilities and containers.
     staging: VecDeque<(InputCapability<T>, C)>,
     staged: Vec<C>,
-    /// Consumed containers available to swap back into subsequently pulled messages.
-    spares: Vec<C>,
 }
 
 impl<T: Timestamp, C: Accountable, P: Pull<Message<T, C>>> InputHandleCore<T, C, P> {
@@ -56,16 +54,9 @@ impl<T: Timestamp, C: Accountable, P: Pull<Message<T, C>>> InputHandleCore<T, C,
     }
     /// Iterates through distinct capabilities and the lists of containers associated with each.
     pub fn for_each_time<F>(&mut self, mut logic: F) where F: FnMut(InputCapability<T>, std::slice::IterMut::<C>), C: Default {
-        let pull_counter = &mut self.pull_counter;
-        let internal = &self.internal;
-        let summaries = &self.summaries;
-        let spares = &mut self.spares;
-        while let Some((guard, bundle)) = pull_counter.next_guarded() {
-            let cap = InputCapability::new(Rc::clone(internal), Rc::clone(summaries), guard);
-            let data = &mut bundle.data;
-            let mut received = spares.pop().unwrap_or_default();
-            std::mem::swap(data, &mut received);
-            self.staging.push_back((cap, received));
+        while let Some((cap, data)) = self.next() {
+            let data = std::mem::take(data);
+            self.staging.push_back((cap, data));
         }
         self.staging.make_contiguous().sort_unstable_by(|x,y| x.0.time().cmp(&y.0.time()));
 
@@ -74,12 +65,7 @@ impl<T: Timestamp, C: Accountable, P: Pull<Message<T, C>>> InputHandleCore<T, C,
             let more = self.staging.iter().take_while(|(c,_)| c.time() == cap.time()).count();
             self.staged.extend(self.staging.drain(..more).map(|(_,d)| d));
             logic(cap, self.staged.iter_mut());
-            // Retain a bounded number of consumed containers. On the next
-            // pull they are swapped into the channel message and can flow
-            // back to a producer that supports resource return.
-            let available = 16usize.saturating_sub(self.spares.len());
-            let retain = available.min(self.staged.len());
-            self.spares.extend(self.staged.drain(..retain));
+            // Could return these back to the input ..
             self.staged.clear();
         }
     }
@@ -98,7 +84,6 @@ pub fn new_input_handle<T: Timestamp, C: Accountable, P: Pull<Message<T, C>>>(
         summaries,
         staging: Default::default(),
         staged: Default::default(),
-        spares: Default::default(),
     }
 }
 

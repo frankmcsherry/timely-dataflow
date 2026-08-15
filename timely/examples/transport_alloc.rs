@@ -10,11 +10,11 @@ use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use timely::Accountable;
 use timely::container::columnar::{ColumnarBuilder, ColumnarContainer};
 use timely::container::{CapacityContainerBuilder, ContainerBuilder, PushInto};
 use timely::dataflow::operators::{Exchange, InspectCore, Probe};
 use timely::dataflow::{InputHandle, ProbeHandle};
-use timely::Accountable;
 
 struct CountingAllocator;
 
@@ -122,7 +122,9 @@ impl Transport {
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() != 5 {
-        eprintln!("usage: transport_alloc <typed|binary> <vec|columnar|columnar-builder> <workers> <rounds> <records-per-round>");
+        eprintln!(
+            "usage: transport_alloc <typed|binary> <vec|columnar|columnar-builder> <workers> <rounds> <records-per-round>"
+        );
         std::process::exit(2);
     }
 
