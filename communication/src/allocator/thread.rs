@@ -74,12 +74,13 @@ impl Thread {
         recycler: RecyclerHandle,
     ) -> (ThreadPusher<T>, ThreadPuller<T>) {
         let shared = Rc::new(RefCell::new(VecDeque::<T>::new()));
+        let pool = recycler.borrow_mut().pool::<T>();
         let pusher = Pusher {
             target: Rc::clone(&shared),
-            recycler: Rc::clone(&recycler),
+            pool: Rc::clone(&pool),
         };
         let pusher = CountPusher::new(pusher, identifier, Rc::clone(&events));
-        let puller = Puller { source: shared, current: None, recycler };
+        let puller = Puller { source: shared, current: None, pool };
         let puller = CountPuller::new(puller, identifier, events);
         (pusher, puller)
     }
@@ -101,26 +102,25 @@ pub(crate) struct Recycler {
 }
 
 impl Recycler {
-    fn recycle<T: 'static>(&mut self, value: T) -> Result<(), T> {
-        let pool = self
+    fn pool<T: 'static>(&mut self) -> Pool<T> {
+        Rc::clone(self
             .pools
             .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(Vec::<T>::new()))
-            .downcast_mut::<Vec<T>>()
-            .expect("TypeId must identify the recycler pool type");
-        if pool.len() < PER_TYPE_LIMIT {
-            pool.push(value);
-            Ok(())
-        } else {
-            Err(value)
-        }
+            .or_insert_with(|| Box::new(Pool::<T>::default()))
+            .downcast_ref::<Pool<T>>()
+            .expect("TypeId must identify the recycler pool type"))
     }
+}
 
-    fn acquire<T: 'static>(&mut self) -> Option<T> {
-        self.pools
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|pool| pool.downcast_mut::<Vec<T>>())
-            .and_then(Vec::pop)
+type Pool<T> = Rc<RefCell<Vec<T>>>;
+
+fn recycle<T>(pool: &Pool<T>, value: T) -> Result<(), T> {
+    let mut pool = pool.borrow_mut();
+    if pool.len() < PER_TYPE_LIMIT {
+        pool.push(value);
+        Ok(())
+    } else {
+        Err(value)
     }
 }
 
@@ -128,7 +128,7 @@ impl Recycler {
 /// The push half of an intra-thread channel.
 pub struct Pusher<T> {
     target: Rc<RefCell<VecDeque<T>>>,
-    recycler: RecyclerHandle,
+    pool: Pool<T>,
 }
 
 impl<T: 'static> Push<T> for Pusher<T> {
@@ -141,7 +141,7 @@ impl<T: 'static> Push<T> for Pusher<T> {
         // `Push::done` calls `push` with `None`; do not remove and immediately
         // drop a pooled value merely to communicate that control signal.
         if sent {
-            *element = self.recycler.borrow_mut().acquire();
+            *element = self.pool.borrow_mut().pop();
         }
     }
 }
@@ -150,14 +150,14 @@ impl<T: 'static> Push<T> for Pusher<T> {
 pub struct Puller<T: 'static> {
     current: Option<T>,
     source: Rc<RefCell<VecDeque<T>>>,
-    recycler: RecyclerHandle,
+    pool: Pool<T>,
 }
 
 impl<T: 'static> Pull<T> for Puller<T> {
     #[inline]
     fn pull(&mut self) -> &mut Option<T> {
         if let Some(element) = self.current.take() {
-            let _ = self.recycler.borrow_mut().recycle(element);
+            let _ = recycle(&self.pool, element);
         }
         self.current = self.source.borrow_mut().pop_front();
         &mut self.current
@@ -167,7 +167,7 @@ impl<T: 'static> Pull<T> for Puller<T> {
 impl<T: 'static> Drop for Puller<T> {
     fn drop(&mut self) {
         if let Some(element) = self.current.take() {
-            let _ = self.recycler.borrow_mut().recycle(element);
+            let _ = recycle(&self.pool, element);
         }
     }
 }
@@ -208,22 +208,22 @@ mod tests {
     #[test]
     fn recycler_bounds_each_concrete_type() {
         let mut recycler = Recycler::default();
-        assert!(recycler.recycle::<Vec<u8>>(Vec::new()).is_ok());
-        assert!(recycler.recycle::<Vec<u8>>(Vec::new()).is_ok());
-        assert!(recycler.recycle::<Vec<u8>>(Vec::new()).is_err());
+        let bytes = recycler.pool::<Vec<u8>>();
+        assert!(recycle(&bytes, Vec::new()).is_ok());
+        assert!(recycle(&bytes, Vec::new()).is_ok());
+        assert!(recycle(&bytes, Vec::new()).is_err());
 
-        assert!(recycler.recycle::<Vec<u64>>(Vec::new()).is_ok());
-        assert!(recycler.recycle::<Vec<u64>>(Vec::new()).is_ok());
-        assert!(recycler.recycle::<Vec<u64>>(Vec::new()).is_err());
+        let words = recycler.pool::<Vec<u64>>();
+        assert!(recycle(&words, Vec::new()).is_ok());
+        assert!(recycle(&words, Vec::new()).is_ok());
+        assert!(recycle(&words, Vec::new()).is_err());
     }
 
     #[test]
     fn done_does_not_discard_a_recycled_value() {
         let recycler = RecyclerHandle::default();
-        recycler
-            .borrow_mut()
-            .recycle::<Vec<u8>>(Vec::with_capacity(1024))
-            .unwrap();
+        let pool = recycler.borrow_mut().pool::<Vec<u8>>();
+        recycle(&pool, Vec::with_capacity(1024)).unwrap();
         let (mut push, _pull) = Thread::new_from_with_recycler::<Vec<u8>>(
             0,
             Rc::new(RefCell::new(Vec::new())),
@@ -232,6 +232,6 @@ mod tests {
 
         push.done();
 
-        assert_eq!(recycler.borrow_mut().acquire::<Vec<u8>>().unwrap().capacity(), 1024);
+        assert_eq!(pool.borrow_mut().pop().unwrap().capacity(), 1024);
     }
 }
